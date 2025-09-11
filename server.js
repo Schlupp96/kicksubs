@@ -46,7 +46,7 @@ app.get("/subs", async (req, res) => {
     await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
     await page.waitForTimeout(1200);
 
-    // Cookie/Consent wegklicken, wenn vorhanden
+    // Consent wegklicken
     try {
       const acceptBtn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -59,53 +59,94 @@ app.get("/subs", async (req, res) => {
       }
     } catch {}
 
-    // 1) Versuche gezielt die Abo-Leiste ("342 / 360") in der Nähe von "Abonnements" zu finden
-    const near = await page.evaluate(() => {
-      const pickSlashNumber = (root) => {
-        if (!root) return "";
-        const txt = (root.textContent || "").replace(/\s+/g, " ").trim();
-        // fange "342 / 360" ab – wir nehmen die erste Zahl links vom Slash
-        const m = txt.match(/(\d[\d\s\.,]*)\s*\/\s*(\d[\d\s\.,]*)/);
-        return m ? m[1] : "";
+    // 1) Progressbar anhand von ARIA finden – zuerst in der Nähe von "Abonnements"
+    const ariaNearby = await page.evaluate(() => {
+      const findProgress = (root) => {
+        if (!root) return null;
+        const pb = root.querySelector('[role="progressbar"][aria-valuenow]');
+        if (!pb) return null;
+        const now = pb.getAttribute("aria-valuenow");
+        const max = pb.getAttribute("aria-valuemax") || "";
+        return { now, max, scope: "aria_near_label" };
       };
 
-      // „Abonnements“ (de), „Subscribers/Subscriptions“ (fallback en)
-      const XP = "//main//*[contains(text(),'Abonnements') or contains(text(),'Abonnements!') or contains(text(),'Subscribers') or contains(text(),'Subscriptions')]";
+      // Label "Abonnements" / engl. Fallbacks
       const label = document.evaluate(
-        XP, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        "//main//*[contains(text(),'Abonnements') or contains(text(),'Abonnements!') or contains(text(),'Subscribers') or contains(text(),'Subscriptions')]",
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null
       ).singleNodeValue;
 
       if (label) {
-        // in Eltern hochlaufen und schauen, ob in diesem Block die "x / y" steht
-        let el = label;
-        for (let i = 0; i < 4 && el; i++) {
-          const got = pickSlashNumber(el.parentElement || el);
-          if (got) return { raw: got, scope: "near_label_parent" };
-          el = el.parentElement;
+        // 1a) im Parent-Block
+        let p = label.parentElement;
+        for (let i = 0; i < 4 && p; i++) {
+          const hit = findProgress(p);
+          if (hit) return hit;
+          p = p.parentElement;
         }
-        // in Geschwistern danach suchen
-        let sib = label.nextElementSibling;
-        for (let i = 0; i < 4 && sib; i++) {
-          const got = pickSlashNumber(sib);
-          if (got) return { raw: got, scope: "near_label_sibling" };
-          sib = sib.nextElementSibling;
+        // 1b) in Geschwistern
+        let s = label.nextElementSibling;
+        for (let i = 0; i < 6 && s; i++) {
+          const hit = findProgress(s);
+          if (hit) return hit;
+          s = s.nextElementSibling;
         }
       }
 
-      // Fallback: Gesamte Seite nach „x / y“ durchsuchen
-      const bodyTxt = (document.body.innerText || "").replace(/\s+/g, " ");
-      const m = bodyTxt.match(/(\d[\d\s\.,]*)\s*\/\s*(\d[\d\s\.,]*)/);
-      if (m) return { raw: m[1], scope: "body_fallback" };
+      // 2) Globaler Fallback: irgendein Progressbar auf der Seite
+      const any = document.querySelector('[role="progressbar"][aria-valuenow]');
+      if (any) {
+        return {
+          now: any.getAttribute("aria-valuenow"),
+          max: any.getAttribute("aria-valuemax") || "",
+          scope: "aria_global",
+        };
+      }
 
-      return { raw: "", scope: "miss" };
+      return null;
     });
 
-    if (near?.raw) {
-      subs = toInt(near.raw);
-      foundRaw = near.raw;
-      log.push(near.scope || "near_label");
+    if (ariaNearby?.now) {
+      subs = parseInt(String(ariaNearby.now).replace(/[^\d]/g, ""), 10) || 0;
+      foundRaw = ariaNearby.now + (ariaNearby.max ? ` / ${ariaNearby.max}` : "");
+      log.push(ariaNearby.scope);
     } else {
-      log.push("not_found");
+      log.push("aria_miss");
+    }
+
+    // 3) Letzter Fallback: sichtbarer Text "x / y"
+    if (!subs) {
+      const txtHit = await page.evaluate(() => {
+        const pick = (root) => {
+          const t = (root?.textContent || "").replace(/\s+/g, " ").trim();
+          const m = t.match(/(\d[\d\s\.,]*)\s*\/\s*(\d[\d\s\.,]*)/);
+          return m ? m[1] : "";
+        };
+
+        const main = document.querySelector("main") || document.body;
+        // Suche in typischen Containern
+        const containers = [
+          main,
+          ...Array.from(main.querySelectorAll("section,div")),
+        ].slice(0, 200);
+
+        for (const c of containers) {
+          const raw = pick(c);
+          if (raw) return { raw, scope: "text_ratio" };
+        }
+        return null;
+      });
+
+      if (txtHit?.raw) {
+        subs = parseInt(txtHit.raw.replace(/[^\d]/g, ""), 10) || 0;
+        foundRaw = txtHit.raw;
+        log.push(txtHit.scope);
+      } else {
+        log.push("text_miss");
+      }
     }
 
     await browser.close();
@@ -115,7 +156,6 @@ app.get("/subs", async (req, res) => {
     return res.status(500).json({ error: e.message, url, log });
   }
 });
-
 /* =======================================================================
    /subs-text – nur Textantwort (für Botrix/Chat)
    ======================================================================= */
