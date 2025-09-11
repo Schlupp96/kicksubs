@@ -1,0 +1,12 @@
+{
+  "name": "kick-followers-service",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.47.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
