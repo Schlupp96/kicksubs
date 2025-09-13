@@ -139,80 +139,90 @@ app.get("/subs", async (req, res) => {
       }
     }
 
-/* 3) Abonnements-basiert: Zahl VOR dem Slash nahe dem Label holen */
+/* 3) Label-gebunden: „Abonnements“ finden → im selben Kasten „X / Y“ lesen → X nehmen */
 if (!subs) {
-  const around = await page.evaluate(() => {
-    // Wir suchen *gezielt* nach dem Label und lesen im selben Block das Muster "X / Y"
-    const LABELS = ["Abonnement", "Abonnements", "Abonnements!", "Abonnenten", "Subscribers", "Subscriptions"];
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const hit = await page.evaluate(() => {
+    const LABELS = ["abonnement", "abonnements", "abonnenten", "subscribers", "subscriptions"];
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const normLower = (s) => norm(s).toLowerCase();
     const main = document.querySelector("main") || document.body;
 
-    const findLabelElements = () => {
-      const nodes = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 4000)];
-      return nodes.filter((el) => {
-        const t = norm(el.textContent || "");
-        if (!t) return false;
-        return LABELS.some((L) => t.includes(L.toLowerCase()));
-      });
-    };
-
-    const findRatioIn = (root) => {
+    const ratioFromNode = (root) => {
       if (!root) return null;
+      const nodes = [root, ...root.querySelectorAll("*")];
 
-      // 1) Im Text der Nachfahren
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-      while (walker.nextNode()) {
-        const txt = (walker.currentNode.nodeValue || "").replace(/\s+/g, " ").trim();
-        const m = txt.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (m) return { num: m[1], den: m[2], src: "desc_text" };
-      }
+      for (const n of nodes) {
+        // Texte prüfen
+        const txt = norm(n.textContent || "");
+        let m = txt.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+        if (m) return { num: m[1], den: m[2], where: "desc_text" };
 
-      // 2) In Attributen (aria-label, title, data-*)
-      const nodes = root.querySelectorAll("*");
-      for (const n of [root, ...nodes]) {
+        // Attribute (aria-label, title, data-*)
         for (const a of Array.from(n.attributes || [])) {
-          const m = (a.value || "").match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-          if (m) return { num: m[1], den: m[2], src: "attr" };
+          const v = norm(a.value || "");
+          m = v.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+          if (m) return { num: m[1], den: m[2], where: "desc_attr" };
         }
       }
-
       return null;
     };
 
-    const labels = findLabelElements();
-    for (const el of labels) {
-      // a) im Container (wenn nötig bis zu 6 Ebenen hoch)
+    // 1) Alle Elemente durchsuchen, die das Label enthalten
+    const all = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 4000)];
+    const labelEls = all.filter((el) => {
+      const t = normLower(el.textContent || "");
+      if (!t) return false;
+      return LABELS.some((L) => t.includes(L));
+    });
+
+    for (const el of labelEls) {
+      // a) im gleichen Container (bis zu 6 Ebenen hoch)
       let p = el;
       for (let i = 0; i < 6 && p; i++) {
-        const hit = findRatioIn(p);
-        if (hit) return { raw: hit.num, den: hit.den, scope: "near_label" };
+        const r = ratioFromNode(p);
+        if (r) {
+          return { raw: r.num, den: r.den, scope: "near_label_container",
+                   ctx: norm(p.textContent || "").slice(0, 160) };
+        }
         p = p.parentElement;
       }
       // b) in den nächsten Geschwistern
       let s = el.nextElementSibling;
       for (let i = 0; i < 6 && s; i++) {
-        const hit = findRatioIn(s);
-        if (hit) return { raw: hit.num, den: hit.den, scope: "label_sibling" };
+        const r = ratioFromNode(s);
+        if (r) {
+          return { raw: r.num, den: r.den, scope: "near_label_sibling",
+                   ctx: norm(s.textContent || "").slice(0, 160) };
+        }
         s = s.nextElementSibling;
       }
     }
 
-    // c) Fallback: global erstes "X / Y" – nimm die Zahl *vor* dem Slash
-    const text = (main.textContent || "").replace(/\s+/g, " ").trim();
-    const mg = text.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-    if (mg) return { raw: mg[1], den: mg[2], scope: "global_ratio" };
+    // 2) HTML-Backup: „…Abonnements… <irgendwas> X / Y“
+    const html = document.documentElement?.innerHTML || "";
+    const mHtml = html.match(/abonnements[\s\S]{0,800}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
+    if (mHtml) {
+      return { raw: mHtml[1], den: mHtml[2], scope: "html_after_label", ctx: "" };
+    }
+
+    // 3) Letzter Fallback (globales X/Y)
+    const txt = norm(main.textContent || "");
+    const mg = txt.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+    if (mg) return { raw: mg[1], den: mg[2], scope: "global_ratio", ctx: txt.slice(0, 160) };
 
     return null;
   });
 
-  if (around?.raw) {
-    foundRaw = around.raw;          // <- das ist die "321"
+  if (hit?.raw) {
+    foundRaw = hit.raw;   // <- das ist die gewünschte „321“
     subs = toInt(foundRaw);
-    log.push(around.scope);
+    log.push(hit.scope);
+    if (debug && hit.ctx) debugPeek = (debugPeek ? debugPeek + " | " : "") + hit.ctx;
   } else {
     log.push("abonnements_scan_miss");
   }
 }
+
 
 
     // Challenge-Erkennung (nur für Diagnose)
