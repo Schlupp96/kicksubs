@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- Helfer ---------- */
+/* Helpers */
 const toInt = (text) => {
   if (!text) return 0;
   const s = String(text).toLowerCase().replace(/,/g, ".").replace(/\s/g, "").trim();
@@ -16,8 +16,8 @@ const toInt = (text) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-/* ---------- EINMALIGE Browser-Funktion ---------- */
-async function getBrowser() {
+/* Browser (nur EINMAL definieren!) */
+async function createBrowser() {
   return chromium.launch({
     headless: true,
     args: [
@@ -31,7 +31,7 @@ async function getBrowser() {
 }
 
 /* =======================================================================
-   /subs – Abonnenten auslesen
+   /subs
    ======================================================================= */
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
@@ -44,7 +44,7 @@ app.get("/subs", async (req, res) => {
   let foundRaw = "";
   let debugPeek = "";
 
-  const browser = await getBrowser();
+  const browser = await createBrowser();
   const ctx = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -57,7 +57,6 @@ app.get("/subs", async (req, res) => {
     },
   });
 
-  // minimales "Stealth"
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en-US", "en"] });
@@ -65,8 +64,6 @@ app.get("/subs", async (req, res) => {
   });
 
   const page = await ctx.newPage();
-
-  // große Assets blocken (JS/CSS erlauben)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (["image", "media", "font"].includes(t)) return route.abort();
@@ -77,7 +74,6 @@ app.get("/subs", async (req, res) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForSelector("body", { timeout: 15000 });
 
-    // Cookiebanner best effort
     try {
       const btn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -87,7 +83,6 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
-    // leicht scrollen + kurzer Delay
     await page.evaluate(async () => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       for (let i = 0; i < 2; i++) { window.scrollBy(0, window.innerHeight); await sleep(200); }
@@ -95,7 +90,7 @@ app.get("/subs", async (req, res) => {
     });
     await page.waitForTimeout(1000);
 
-    // 1) ARIA-Progressbar (wenn vorhanden)
+    // 1) Progressbar
     try {
       const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
         els.map(e => ({
@@ -117,39 +112,25 @@ app.get("/subs", async (req, res) => {
       }
     } catch { log.push("aria_error"); }
 
-    // 2) Body-Text/Regex (robust gegen SPA/Anti-Bot)
+    // 2) Body-Text / Regex
     if (!subs) {
       const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
       if (debug) debugPeek = bodyText.slice(0, 800);
 
-      // nach Label -> erste Zahl dahinter
       const lower = bodyText.toLowerCase();
       const labels = ["abonnements!", "abonnements", "abonnenten", "subscribers", "subscriptions"];
       let afterIdx = -1;
-      for (const L of labels) {
-        const i = lower.indexOf(L);
-        if (i >= 0) { afterIdx = i + L.length; break; }
-      }
+      for (const L of labels) { const i = lower.indexOf(L); if (i >= 0) { afterIdx = i + L.length; break; } }
       if (afterIdx >= 0) {
         const tail = bodyText.slice(afterIdx);
         const mAfter = tail.match(/(\d[\d\.,\s]*)/);
-        if (mAfter) {
-          foundRaw = mAfter[1];
-          subs = toInt(foundRaw);
-          log.push("text_after_label");
-        }
+        if (mAfter) { foundRaw = mAfter[1]; subs = toInt(foundRaw); log.push("text_after_label"); }
       }
 
-      // Fallback: erstes "x / y"
       if (!subs) {
         const mRatio = bodyText.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (mRatio) {
-          foundRaw = mRatio[1];
-          subs = toInt(foundRaw);
-          log.push("text_ratio_global");
-        } else {
-          log.push("text_no_match");
-        }
+        if (mRatio) { foundRaw = mRatio[1]; subs = toInt(foundRaw); log.push("text_ratio_global"); }
+        else { log.push("text_no_match"); }
       }
 
       if (!subs && /access denied|verify you are human|enable javascript|cloudflare/i.test(bodyText)) {
@@ -168,7 +149,7 @@ app.get("/subs", async (req, res) => {
 });
 
 /* =======================================================================
-   /subs-text – nur Textantwort
+   /subs-text
    ======================================================================= */
 app.get("/subs-text", async (req, res) => {
   const slug = (req.query.slug || "").trim();
@@ -189,7 +170,7 @@ app.get("/subs-text", async (req, res) => {
   res.type("text/plain; charset=utf-8").send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
 });
 
-/* ---------- Server starten ---------- */
+/* Start */
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
