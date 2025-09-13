@@ -4,7 +4,13 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------------- Helpers ---------------- */
+// --------- Helper ---------
+const UA_POOL = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+];
+
 const toInt = (text) => {
   if (!text) return 0;
   const s = String(text).toLowerCase().replace(/,/g, ".").replace(/\s/g, "").trim();
@@ -16,8 +22,12 @@ const toInt = (text) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+function randFrom(a) { return a[Math.floor(Math.random() * a.length)] || a[0]; }
+
+// --------- Browser / Page helpers ---------
 async function createBrowser() {
-  return chromium.launch({
+  const proxyUrl = process.env.KICK_PROXY_URL || process.env.HTTP_PROXY || process.env.http_proxy || "";
+  const launchOptions = {
     headless: true,
     args: [
       "--no-sandbox",
@@ -26,12 +36,14 @@ async function createBrowser() {
       "--disable-gpu",
       "--disable-blink-features=AutomationControlled",
     ],
-  });
+  };
+  if (proxyUrl) {
+    launchOptions.proxy = { server: proxyUrl };
+    console.log("[subs] Using proxy:", proxyUrl.split("@").pop()); // loggt ohne Credentials
+  }
+  return chromium.launch(launchOptions);
 }
 
-/* ---------------- Page helpers ---------------- */
-
-// Öffnet sicher den „Über/About“-Tab, falls die SPA nicht korrekt dort gelandet ist
 async function ensureAboutOpen(page) {
   try {
     const link =
@@ -45,7 +57,6 @@ async function ensureAboutOpen(page) {
   } catch {}
 }
 
-// Scrollt die Seite einmal vollständig durch (Lazy-Loading anstoßen)
 async function deepScroll(page) {
   await page.evaluate(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,7 +72,6 @@ async function deepScroll(page) {
   });
 }
 
-// Liest im Umfeld des Labels „Abonnements/…“ die Zahl **vor** dem Slash („X / Y“) aus
 async function readSubsNearLabel(page) {
   return page.evaluate(() => {
     const LABELS = ["Abonnement", "Abonnements", "Abonnenten", "Subscribers", "Subscriptions"];
@@ -84,21 +94,18 @@ async function readSubsNearLabel(page) {
       return null;
     };
 
-    // Erstes Element, das eines der Label-Wörter enthält
     const all = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 5000)];
     const labelEl = all.find((el) =>
       LABELS.some((L) => (el.textContent || "").toLowerCase().includes(L.toLowerCase()))
     );
     if (!labelEl) return null;
 
-    // a) Im Container / Eltern (bis 6 Ebenen)
     let p = labelEl;
     for (let i = 0; i < 6 && p; i++) {
       const r = ratioFrom(p);
       if (r) return { raw: r.num, scope: r.scope };
       p = p.parentElement;
     }
-    // b) In nachfolgenden Geschwistern (bis 8 Schritte)
     let s = labelEl.nextElementSibling;
     for (let i = 0; i < 8 && s; i++) {
       const r = ratioFrom(s);
@@ -106,16 +113,19 @@ async function readSubsNearLabel(page) {
       s = s.nextElementSibling;
     }
 
-    // c) HTML-Fallback: „abonn… … X / Y“ (bis 1200 Zeichen danach)
     const html = document.documentElement?.innerHTML || "";
     const m = html.match(/abonn\w*[\s\S]{0,1200}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
     if (m) return { raw: m[1], scope: "html_after_label" };
-
     return null;
   });
 }
 
-/* ---------------- /subs ---------------- */
+function looksBlockedText(t = "") {
+  const s = (t || "").toLowerCase();
+  return /request blocked by security policy|access denied|verify you are human|captcha|bot detected|blocked/i.test(s);
+}
+
+// --------- /subs ---------
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
   const debug = String(req.query.debug || "") === "1";
@@ -126,11 +136,11 @@ app.get("/subs", async (req, res) => {
   let subs = 0;
   let foundRaw = "";
   let debugPeek = "";
+  let blocked = false;
 
   const browser = await createBrowser();
   const ctx = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    userAgent: randFrom(UA_POOL),
     locale: "de-DE",
     timezoneId: "Europe/Berlin",
     viewport: { width: 1368, height: 900 },
@@ -140,7 +150,6 @@ app.get("/subs", async (req, res) => {
     },
   });
 
-  // minimales Stealth
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en-US", "en"] });
@@ -150,7 +159,17 @@ app.get("/subs", async (req, res) => {
   const page = await ctx.newPage();
 
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    if (!resp || !resp.ok()) {
+      log.push(`http_${resp?.status?.() ?? "noresp"}`);
+    }
+
+    // Block-Check: viele WAFs liefern kleines JSON/HTML mit "Request blocked by security policy."
+    const firstText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
+    if (looksBlockedText(firstText)) {
+      blocked = true;
+      debugPeek = firstText;
+    }
 
     // Cookiebanner (best effort)
     try {
@@ -162,13 +181,13 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
-    // ==== bis zu 4 Versuche: Tab öffnen, scrollen, dann lesen ====
-    for (let attempt = 1; attempt <= 4 && !subs; attempt++) {
+    // bis zu 4 Versuche
+    for (let attempt = 1; attempt <= 4 && !subs && !blocked; attempt++) {
       await ensureAboutOpen(page);
       await deepScroll(page);
       await page.waitForTimeout(700);
 
-      // 1) ARIA-Progressbar (wenn vorhanden)
+      // 1) ARIA
       try {
         const ariaVals = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
           els.map(e => e.getAttribute("aria-valuenow") || "").filter(Boolean)
@@ -187,7 +206,7 @@ app.get("/subs", async (req, res) => {
         }
       } catch { log.push("aria_error"); }
 
-      // 2) Strikt am Label „Abonn…“ → „X / Y“ → X
+      // 2) Label-basiert (X vor / nahe „Abonnements“)
       const near = await readSubsNearLabel(page);
       if (near?.raw) {
         foundRaw = near.raw;
@@ -198,45 +217,55 @@ app.get("/subs", async (req, res) => {
         log.push("abonnements_scan_miss");
       }
 
+      // nach jedem Versuch prüfen, ob wir inzwischen eine Block-Seite sehen
+      const probe = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
+      if (looksBlockedText(probe)) {
+        blocked = true;
+        debugPeek = probe;
+        break;
+      }
+
       await page.waitForTimeout(900);
     }
 
-    if (debug && !foundRaw) {
-      const text = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
-      debugPeek = text.slice(0, 400);
-    }
-
     await browser.close();
-    return res.json({ subs, foundRaw, url, log, ...(debug ? { debugPeek } : {}) });
+    const out = { subs, foundRaw, url, log };
+    if (debug) out.debugPeek = blocked ? debugPeek : (debugPeek || "");
+    if (blocked) out.blocked = true;
+    return res.json(out);
   } catch (e) {
     await browser.close();
     return res.status(500).json({ error: e.message, url, log });
   }
 });
 
-/* ---------------- /subs-text ---------------- */
+// --------- /subs-text ---------
 app.get("/subs-text", async (req, res) => {
   const slug = (req.query.slug || "").trim();
   const name = (req.query.name || slug || "Der Kanal").trim();
   if (!slug) return res.status(400).type("text/plain").send("Missing ?slug=");
 
   let subs = 0;
+  let blocked = false;
+
   try {
-    // Immer lokal aufrufen – stabil auf Render
     const local = `http://127.0.0.1:${PORT}/subs?slug=${encodeURIComponent(slug)}`;
     const r = await fetch(local);
     if (r.ok) {
       const j = await r.json();
       if (typeof j.subs === "number" && Number.isFinite(j.subs)) subs = j.subs;
+      if (j.blocked) blocked = true;
     }
   } catch {}
 
-  res
-    .type("text/plain; charset=utf-8")
-    .send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
+  const msg = blocked
+    ? `⚠️ ${name}: Zugriff von dieser IP blockiert – kein Wert verfügbar.`
+    : `🎁 ${name} hat aktuell ${subs} Subscriber 💚`;
+
+  res.type("text/plain; charset=utf-8").send(msg);
 });
 
-/* ---------------- Start ---------------- */
+// --------- Start ---------
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
