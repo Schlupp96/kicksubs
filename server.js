@@ -168,3 +168,75 @@ app.get("/subs", async (req, res) => {
             let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
             if (m) return { scope: "near_label_ratio", raw: m[1] };
             const ih = norm(el.innerHTML || "");
+            m = ih.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+            if (m) return { scope: "near_label_ratio_html", raw: m[1] };
+            const withAttrs = el.querySelectorAll("*");
+            for (const n of [el, ...withAttrs]) {
+              for (const a of Array.from(n.attributes || [])) {
+                const hit = firstNum(a.value);
+                if (hit) return { scope: "near_label_attr", raw: hit };
+              }
+            }
+            let p = el.parentElement;
+            for (let i = 0; i < 4 && p; i++) {
+              const pt = norm(p.textContent || "");
+              const h = firstNum(pt);
+              if (h) return { scope: "near_label_parent_text", raw: h };
+              p = p.parentElement;
+            }
+          }
+          return null;
+        });
+
+        if (around?.raw) {
+          foundRaw = around.raw;
+          subs = toInt(foundRaw);
+          log.push(around.scope || "near_label_html");
+        } else {
+          log.push("html_scan_miss");
+        }
+      }
+    }
+
+    // Challenge-Erkennung (nur für Diagnose)
+    if (!subs) {
+      const txt = await page.evaluate(() => (document.body.innerText || "").toLowerCase());
+      if (/(access denied|verify you are human|enable javascript|cloudflare)/i.test(txt)) {
+        log.push("challenge_detected");
+      }
+    }
+
+    await browser.close();
+    const out = { subs, foundRaw, url, log };
+    if (debug) out.debugPeek = debugPeek;
+    return res.json(out);
+  } catch (e) {
+    await browser.close();
+    return res.status(500).json({ error: e.message, url, log });
+  }
+});
+
+/* ---------------- /subs-text ---------------- */
+app.get("/subs-text", async (req, res) => {
+  const slug = (req.query.slug || "").trim();
+  const name = (req.query.name || slug || "Der Kanal").trim();
+  if (!slug) return res.status(400).type("text/plain").send("Missing ?slug=");
+
+  let subs = 0;
+  try {
+    const u = new URL(`${req.protocol}://${req.get("host")}/subs`);
+    u.searchParams.set("slug", slug);
+    const r = await fetch(u.toString());
+    if (r.ok) {
+      const j = await r.json();
+      if (typeof j.subs === "number") subs = j.subs;
+    }
+  } catch {}
+
+  res.type("text/plain; charset=utf-8").send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
+});
+
+/* ---------------- Start ---------------- */
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
