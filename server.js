@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ==================== Helper ==================== */
+/* ---------------- Helper ---------------- */
 const toInt = (text) => {
   if (!text) return 0;
   const s = String(text).toLowerCase().replace(/,/g, ".").replace(/\s/g, "").trim();
@@ -29,7 +29,7 @@ async function createBrowser() {
   });
 }
 
-/* ==================== /subs ==================== */
+/* ---------------- /subs ---------------- */
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
   const debug = String(req.query.debug || "") === "1";
@@ -54,6 +54,7 @@ app.get("/subs", async (req, res) => {
     },
   });
 
+  // minimales Stealth
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en-US", "en"] });
@@ -61,17 +62,19 @@ app.get("/subs", async (req, res) => {
   });
 
   const page = await ctx.newPage();
+
+  // eher schlank: Bilder & Media blocken, Fonts/CSS/JS erlauben
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
-    if (["image", "media", "font"].includes(t)) return route.abort();
+    if (["image", "media"].includes(t)) return route.abort();
     return route.continue();
   });
 
   try {
+    // kein networkidle / kein waitForSelector('body') mehr
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForSelector("body", { timeout: 15000 });
 
-    // Cookiebanner wegklicken
+    // Cookiebanner (best effort)
     try {
       const btn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -81,15 +84,15 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
-    // leicht scrollen
+    // sanft anscrollen + kleiner Delay, damit SPA hydratisiert
     await page.evaluate(async () => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       for (let i = 0; i < 2; i++) { window.scrollBy(0, window.innerHeight); await sleep(200); }
       window.scrollTo(0, 0);
     });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1200);
 
-    /* === 1) ARIA-Progressbar === */
+    /* 1) ARIA Progressbar */
     try {
       const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
         els.map(e => ({
@@ -105,18 +108,20 @@ app.get("/subs", async (req, res) => {
           subs = n;
           foundRaw = pick.now + (pick.max ? ` / ${pick.max}` : "");
           log.push("aria_found");
+        } else {
+          log.push("aria_zero");
         }
       } else {
         log.push("aria_none");
       }
     } catch { log.push("aria_error"); }
 
-    /* === 2) Text/HTML-Fallback === */
+    /* 2) Sichtbarer Text */
     if (!subs) {
       const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
       if (debug) debugPeek = bodyText.slice(0, 400);
 
-      // (a) Zahl hinter Label
+      // Zahl direkt hinter Label
       const lower = bodyText.toLowerCase();
       const labels = ["abonnements!", "abonnements", "abonnenten", "subscribers", "subscriptions"];
       let afterIdx = -1;
@@ -127,106 +132,39 @@ app.get("/subs", async (req, res) => {
         if (mAfter) { foundRaw = mAfter[1]; subs = toInt(foundRaw); log.push("text_after_label"); }
       }
 
-      // (b) Ratio im Text
+      // „x / y“ im sichtbaren Text
       if (!subs) {
         const mRatio = bodyText.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
         if (mRatio) { foundRaw = mRatio[1]; subs = toInt(foundRaw); log.push("text_ratio_visible"); }
       }
+    }
 
-      // (c) HTML-Quelltext nach Ratio
-      if (!subs) {
-        const html = await page.content();
-        const mHtml = html.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (mHtml) {
-          foundRaw = mHtml[1];
-          subs = toInt(foundRaw);
-          log.push("text_ratio_html");
-        } else {
-          // (d) gezielt DOM bei "Abonnements"
-          const around = await page.evaluate(() => {
-            const LABELS = ["Abonnements","Abonnements!","Abonnenten","Subscribers","Subscriptions"];
-            const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-            const main = document.querySelector("main") || document.body;
-            const candidates = Array.from(main.querySelectorAll("*")).filter(el => {
-              const txt = norm(el.textContent || "");
-              const attrs = Array.from(el.attributes || []).map(a => `${a.name}=${a.value}`).join(" ");
-              return LABELS.some(L => txt.includes(L) || attrs.toLowerCase().includes(L.toLowerCase()));
-            });
-            const takeFirstNumber = (s) => {
-              const m = norm(s).match(/(\d[\d\.\s,]*)/);
-              return m ? m[1] : "";
-            };
-            for (const el of candidates) {
-              const t = norm(el.textContent || "");
-              let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-              if (m) return { scope: "near_label_ratio", raw: m[1] };
-              const ih = norm(el.innerHTML || "");
-              m = ih.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-              if (m) return { scope: "near_label_ratio_html", raw: m[1] };
-              const withAttrs = el.querySelectorAll("*");
-              for (const n of [el, ...withAttrs]) {
-                for (const a of Array.from(n.attributes || [])) {
-                  const hit = takeFirstNumber(a.value);
-                  if (hit) return { scope: "near_label_attr", raw: hit };
-                }
-              }
-              let p = el.parentElement;
-              for (let i = 0; i < 4 && p; i++) {
-                const pt = norm(p.textContent || "");
-                const h = takeFirstNumber(pt);
-                if (h) return { scope: "near_label_parent_text", raw: h };
-                p = p.parentElement;
-              }
-            }
-            return null;
+    /* 3) HTML + Umfeld „Abonnements“ (inkl. Attribute) */
+    if (!subs) {
+      const html = await page.content();
+
+      // globales „x / y“ im HTML
+      const mHtml = html.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+      if (mHtml) {
+        foundRaw = mHtml[1];
+        subs = toInt(foundRaw);
+        log.push("text_ratio_html");
+      } else {
+        const around = await page.evaluate(() => {
+          const LABELS = ["Abonnements","Abonnements!","Abonnenten","Subscribers","Subscriptions"];
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const main = document.querySelector("main") || document.body;
+          const candidates = Array.from(main.querySelectorAll("*")).filter(el => {
+            const txt = norm(el.textContent || "");
+            const attrs = Array.from(el.attributes || []).map(a => `${a.name}=${a.value}`).join(" ");
+            return LABELS.some(L => txt.includes(L) || attrs.toLowerCase().includes(L.toLowerCase()));
           });
-          if (around?.raw) {
-            foundRaw = around.raw;
-            subs = toInt(foundRaw);
-            log.push(around.scope || "near_label_html");
-          } else {
-            log.push("html_scan_miss");
-          }
-        }
-      }
-
-      // (e) Challenge-Erkennung
-      if (!subs && /access denied|verify you are human|enable javascript|cloudflare/i.test(bodyText)) {
-        log.push("challenge_detected");
-      }
-    }
-
-    await browser.close();
-    const out = { subs, foundRaw, url, log };
-    if (debug) out.debugPeek = debugPeek;
-    return res.json(out);
-  } catch (e) {
-    await browser.close();
-    return res.status(500).json({ error: e.message, url, log });
-  }
-});
-
-/* ==================== /subs-text ==================== */
-app.get("/subs-text", async (req, res) => {
-  const slug = (req.query.slug || "").trim();
-  const name = (req.query.name || slug || "Der Kanal").trim();
-  if (!slug) return res.status(400).type("text/plain").send("Missing ?slug=");
-
-  let subs = 0;
-  try {
-    const u = new URL(`${req.protocol}://${req.get("host")}/subs`);
-    u.searchParams.set("slug", slug);
-    const r = await fetch(u.toString());
-    if (r.ok) {
-      const j = await r.json();
-      if (typeof j.subs === "number") subs = j.subs;
-    }
-  } catch {}
-
-  res.type("text/plain; charset=utf-8").send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
-});
-
-/* ==================== Start ==================== */
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+          const firstNum = (s) => {
+            const m = norm(s).match(/(\d[\d\.\s,]*)/);
+            return m ? m[1] : "";
+          };
+          for (const el of candidates) {
+            const t = norm(el.textContent || "");
+            let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+            if (m) return { scope: "near_label_ratio", raw: m[1] };
+            const ih = norm(el.innerHTML || "");
