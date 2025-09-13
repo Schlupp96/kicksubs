@@ -29,6 +29,90 @@ async function createBrowser() {
   });
 }
 
+/* ---------------- intern: Scroll + Extraktion ---------------- */
+async function deepScroll(page) {
+  await page.evaluate(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    let h = document.body.scrollHeight;
+    let y = 0;
+    while (y + innerHeight < h && y < 20000) { // hartes Cap
+      y += Math.floor(innerHeight * 0.9);
+      scrollTo(0, y);
+      await sleep(250);
+      h = document.body.scrollHeight;
+    }
+    // kurz wieder nach oben
+    scrollTo(0, 0);
+  });
+}
+
+async function extractSubsNearLabel(page) {
+  return await page.evaluate(() => {
+    const LABELS = ["abonnement", "abonnements", "abonnenten", "subscribers", "subscriptions"];
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const low = (s) => norm(s).toLowerCase();
+    const main = document.querySelector("main") || document.body;
+
+    const ratioFromNode = (root) => {
+      if (!root) return null;
+      const nodes = [root, ...root.querySelectorAll("*")];
+      for (const n of nodes) {
+        // Text
+        const t = norm(n.textContent || "");
+        let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+        if (m) return { num: m[1], den: m[2], scope: "near_label_text" };
+        // Attribute
+        for (const a of Array.from(n.attributes || [])) {
+          const v = norm(a.value || "");
+          m = v.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+          if (m) return { num: m[1], den: m[2], scope: "near_label_attr" };
+        }
+      }
+      return null;
+    };
+
+    // Kandidaten mit Label
+    const nodes = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 5000)];
+    const labels = nodes.filter((el) => {
+      const txt = low(el.textContent || "");
+      if (!txt) return false;
+      return LABELS.some((L) => txt.includes(L));
+    });
+
+    for (const el of labels) {
+      // im Container (bis 6 Eltern hoch)
+      let p = el;
+      for (let i = 0; i < 6 && p; i++) {
+        const r = ratioFromNode(p);
+        if (r) return { raw: r.num, scope: r.scope };
+        p = p.parentElement;
+      }
+      // in den nächsten Geschwistern
+      let s = el.nextElementSibling;
+      for (let i = 0; i < 6 && s; i++) {
+        const r = ratioFromNode(s);
+        if (r) return { raw: r.num, scope: "near_label_sibling" };
+        s = s.nextElementSibling;
+      }
+    }
+
+    // HTML-Backup: „…abonn… <irgendwas> X / Y“  (max 1200 Zeichen danach)
+    const html = document.documentElement?.innerHTML || "";
+    const mHtml = html.match(/abonn\w*[\s\S]{0,1200}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
+    if (mHtml) return { raw: mHtml[1], scope: "html_after_label" };
+
+    return null;
+  });
+}
+
+async function extractGlobalRatio(page) {
+  return await page.evaluate(() => {
+    const t = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+    const m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+    return m ? { raw: m[1], scope: "text_ratio_global" } : null;
+  });
+}
+
 /* ---------------- /subs ---------------- */
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
@@ -54,7 +138,7 @@ app.get("/subs", async (req, res) => {
     },
   });
 
-  // minimales Stealth
+  // kleines Stealth
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en-US", "en"] });
@@ -62,8 +146,7 @@ app.get("/subs", async (req, res) => {
   });
 
   const page = await ctx.newPage();
-
-  // eher schlank: Bilder & Media blocken, Fonts/CSS/JS erlauben
+  // Bilder/Media blocken (JS/CSS/Fonts erlauben)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (["image", "media"].includes(t)) return route.abort();
@@ -71,10 +154,9 @@ app.get("/subs", async (req, res) => {
   });
 
   try {
-    // kein networkidle / kein waitForSelector('body') mehr
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // Cookiebanner (best effort)
+    // Cookiebanner best effort
     try {
       const btn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -84,159 +166,61 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
-    // sanft anscrollen + kleiner Delay, damit SPA hydratisiert
-    await page.evaluate(async () => {
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      for (let i = 0; i < 2; i++) { window.scrollBy(0, window.innerHeight); await sleep(200); }
-      window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(1200);
+    // ===== 3 Versuche: scrollen + in Label-Nähe lesen =====
+    for (let attempt = 1; attempt <= 3 && !subs; attempt++) {
+      await deepScroll(page);
+      await page.waitForTimeout(600);
 
-    /* 1) ARIA Progressbar */
-    try {
-      const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
-        els.map(e => ({
-          now: e.getAttribute("aria-valuenow") || "",
-          max: e.getAttribute("aria-valuemax") || "",
-        }))
-      );
-      if (aria && aria.length) {
-        aria.sort((a,b) => (parseInt(b.max||"0",10)||0) - (parseInt(a.max||"0",10)||0));
-        const pick = aria[0];
-        const n = parseInt(String(pick.now).replace(/[^\d]/g, ""), 10) || 0;
-        if (n) {
-          subs = n;
-          foundRaw = pick.now + (pick.max ? ` / ${pick.max}` : "");
+      // 1) ARIA (falls vorhanden)
+      try {
+        const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
+          els.map(e => e.getAttribute("aria-valuenow") || "")
+        );
+        const first = aria.find(v => !!v);
+        if (first) {
+          foundRaw = first;
+          subs = toInt(first);
           log.push("aria_found");
+          break;
         } else {
-          log.push("aria_zero");
+          log.push("aria_none");
         }
+      } catch {
+        log.push("aria_error");
+      }
+
+      // 2) Strikt am Label „Abonn…“ auslesen (X vor /)
+      const near = await extractSubsNearLabel(page);
+      if (near?.raw) {
+        foundRaw = near.raw;
+        subs = toInt(foundRaw);
+        log.push(near.scope);
+        break;
       } else {
-        log.push("aria_none");
+        log.push("abonnements_scan_miss");
       }
-    } catch { log.push("aria_error"); }
 
-    /* 2) Sichtbarer Text */
-    if (!subs) {
+      // 3) Letzter Versuch im Durchgang: globales „X / Y“
+      const glob = await extractGlobalRatio(page);
+      if (glob?.raw) {
+        foundRaw = glob.raw;
+        subs = toInt(foundRaw);
+        log.push(glob.scope);
+        break;
+      }
+
+      // kleiner Cooldown zwischen den Versuchen
+      await page.waitForTimeout(700);
+    }
+
+    if (debug && !foundRaw) {
+      // nur kurze Probe
       const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
-      if (debug) debugPeek = bodyText.slice(0, 400);
-
-      // Zahl direkt hinter Label
-      const lower = bodyText.toLowerCase();
-      const labels = ["abonnements!", "abonnements", "abonnenten", "subscribers", "subscriptions"];
-      let afterIdx = -1;
-      for (const L of labels) { const i = lower.indexOf(L); if (i >= 0) { afterIdx = i + L.length; break; } }
-      if (afterIdx >= 0) {
-        const tail = bodyText.slice(afterIdx);
-        const mAfter = tail.match(/(\d[\d\.,\s]*)/);
-        if (mAfter) { foundRaw = mAfter[1]; subs = toInt(foundRaw); log.push("text_after_label"); }
-      }
-
-      // „x / y“ im sichtbaren Text
-      if (!subs) {
-        const mRatio = bodyText.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (mRatio) { foundRaw = mRatio[1]; subs = toInt(foundRaw); log.push("text_ratio_visible"); }
-      }
-    }
-
-/* 3) Label-gebunden: „Abonnements“ finden → im selben Kasten „X / Y“ lesen → X nehmen */
-if (!subs) {
-  const hit = await page.evaluate(() => {
-    const LABELS = ["abonnement", "abonnements", "abonnenten", "subscribers", "subscriptions"];
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-    const normLower = (s) => norm(s).toLowerCase();
-    const main = document.querySelector("main") || document.body;
-
-    const ratioFromNode = (root) => {
-      if (!root) return null;
-      const nodes = [root, ...root.querySelectorAll("*")];
-
-      for (const n of nodes) {
-        // Texte prüfen
-        const txt = norm(n.textContent || "");
-        let m = txt.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (m) return { num: m[1], den: m[2], where: "desc_text" };
-
-        // Attribute (aria-label, title, data-*)
-        for (const a of Array.from(n.attributes || [])) {
-          const v = norm(a.value || "");
-          m = v.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-          if (m) return { num: m[1], den: m[2], where: "desc_attr" };
-        }
-      }
-      return null;
-    };
-
-    // 1) Alle Elemente durchsuchen, die das Label enthalten
-    const all = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 4000)];
-    const labelEls = all.filter((el) => {
-      const t = normLower(el.textContent || "");
-      if (!t) return false;
-      return LABELS.some((L) => t.includes(L));
-    });
-
-    for (const el of labelEls) {
-      // a) im gleichen Container (bis zu 6 Ebenen hoch)
-      let p = el;
-      for (let i = 0; i < 6 && p; i++) {
-        const r = ratioFromNode(p);
-        if (r) {
-          return { raw: r.num, den: r.den, scope: "near_label_container",
-                   ctx: norm(p.textContent || "").slice(0, 160) };
-        }
-        p = p.parentElement;
-      }
-      // b) in den nächsten Geschwistern
-      let s = el.nextElementSibling;
-      for (let i = 0; i < 6 && s; i++) {
-        const r = ratioFromNode(s);
-        if (r) {
-          return { raw: r.num, den: r.den, scope: "near_label_sibling",
-                   ctx: norm(s.textContent || "").slice(0, 160) };
-        }
-        s = s.nextElementSibling;
-      }
-    }
-
-    // 2) HTML-Backup: „…Abonnements… <irgendwas> X / Y“
-    const html = document.documentElement?.innerHTML || "";
-    const mHtml = html.match(/abonnements[\s\S]{0,800}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
-    if (mHtml) {
-      return { raw: mHtml[1], den: mHtml[2], scope: "html_after_label", ctx: "" };
-    }
-
-    // 3) Letzter Fallback (globales X/Y)
-    const txt = norm(main.textContent || "");
-    const mg = txt.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-    if (mg) return { raw: mg[1], den: mg[2], scope: "global_ratio", ctx: txt.slice(0, 160) };
-
-    return null;
-  });
-
-  if (hit?.raw) {
-    foundRaw = hit.raw;   // <- das ist die gewünschte „321“
-    subs = toInt(foundRaw);
-    log.push(hit.scope);
-    if (debug && hit.ctx) debugPeek = (debugPeek ? debugPeek + " | " : "") + hit.ctx;
-  } else {
-    log.push("abonnements_scan_miss");
-  }
-}
-
-
-
-    // Challenge-Erkennung (nur für Diagnose)
-    if (!subs) {
-      const txt = await page.evaluate(() => (document.body.innerText || "").toLowerCase());
-      if (/(access denied|verify you are human|enable javascript|cloudflare)/i.test(txt)) {
-        log.push("challenge_detected");
-      }
+      debugPeek = bodyText.slice(0, 400);
     }
 
     await browser.close();
-    const out = { subs, foundRaw, url, log };
-    if (debug) out.debugPeek = debugPeek;
-    return res.json(out);
+    return res.json({ subs, foundRaw, url, log, ...(debug ? { debugPeek } : {}) });
   } catch (e) {
     await browser.close();
     return res.status(500).json({ error: e.message, url, log });
@@ -251,22 +235,18 @@ app.get("/subs-text", async (req, res) => {
 
   let subs = 0;
   try {
-    // immer lokal anfragen – unabhängig von Proxy/HTTPS
     const local = `http://127.0.0.1:${PORT}/subs?slug=${encodeURIComponent(slug)}`;
-    const r = await fetch(local, { method: "GET" });
+    const r = await fetch(local);
     if (r.ok) {
       const j = await r.json();
       if (typeof j.subs === "number" && Number.isFinite(j.subs)) subs = j.subs;
     }
-  } catch (e) {
-    // optional etwas Robustheit: notfalls NICHT 0 senden
-  }
+  } catch {}
 
   res
     .type("text/plain; charset=utf-8")
     .send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
 });
-
 
 /* ---------------- Start ---------------- */
 app.listen(PORT, () => {
