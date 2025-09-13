@@ -28,12 +28,14 @@ async function getBrowser() {
    ======================================================================= */
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
+  const debug = String(req.query.debug || "") === "1";
   if (!slug) return res.status(400).json({ error: "Missing ?slug=" });
 
   const url = `https://kick.com/${slug}/about`;
   const log = [];
   let subs = 0;
   let foundRaw = "";
+  let debugPeek = "";
 
   const browser = await getBrowser();
   const page = await browser.newPage({
@@ -48,107 +50,134 @@ app.get("/subs", async (req, res) => {
     await page.waitForLoadState("networkidle", { timeout: 45000 });
     await page.waitForSelector("main", { timeout: 15000 });
 
-    // Einmal komplett scrollen (manchmal lädt der Bereich erst dann)
+    // Seite einmal „anstoßen“, damit eventuelle Lazy-Blöcke laden
     await page.evaluate(async () => {
       const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-      const h = document.body.scrollHeight;
-      const step = Math.max(300, Math.floor(h / 6));
-      for (let y = 0; y < h; y += step) {
-        window.scrollTo(0, y);
-        await delay(200);
+      for (let i = 0; i < 4; i++) {
+        window.scrollBy(0, window.innerHeight);
+        await delay(250);
       }
       window.scrollTo(0, 0);
     });
 
-    // Consent wegklicken (best effort)
+    // Cookie-Banner weg
     try {
-      const acceptBtn =
+      const btn =
         (await page.$("text=Alle akzeptieren")) ||
         (await page.$("text=Akzeptieren")) ||
         (await page.$("text=Accept all")) ||
         (await page.$("text=Accept"));
-      if (acceptBtn) {
-        await acceptBtn.click({ timeout: 900 });
-        log.push("consent_clicked");
-      }
+      if (btn) { await btn.click({ timeout: 1000 }); log.push("consent_clicked"); }
     } catch {}
 
-    // --- 1) Bereich mit Label "Abonnements" (oder engl. Fallback) finden
-    await page.waitForTimeout(500);
-    await page.waitForSelector("main", { timeout: 10000 }).catch(() => {});
-
-    const result = await page.evaluate(() => {
-      const LABELS = ["Abonnements", "Abonnements!", "Abonnenten", "Subscribers", "Subscriptions"];
-
-      const getNearestContainer = (el) => {
-        // gehe bis zu 6 Ebenen hoch, um den umgebenden Block zu finden
-        let p = el;
-        for (let i = 0; i < 6 && p; i++) {
-          if (p.querySelector('[role="progressbar"],div,section')) return p;
-          p = p.parentElement;
+    // ---------- 1) Einfach: irgendein Progressbar mit aria-valuenow ----------
+    try {
+      await page.waitForSelector('[role="progressbar"][aria-valuenow]', { timeout: 8000 });
+      const allNow = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
+        els.map(e => ({
+          now: e.getAttribute('aria-valuenow') || '',
+          max: e.getAttribute('aria-valuemax') || '',
+          text: (e.textContent || '').replace(/\s+/g,' ').trim()
+        }))
+      );
+      if (allNow?.length) {
+        // Nimm den mit der größten "max" (typisch 360) – das ist fast immer der Sub-Balken
+        allNow.sort((a,b) => (parseInt(b.max||'0',10) || 0) - (parseInt(a.max||'0',10) || 0));
+        const pick = allNow[0];
+        const n = parseInt(String(pick.now).replace(/[^\d]/g, ""), 10) || 0;
+        if (n) {
+          subs = n;
+          foundRaw = pick.now + (pick.max ? ` / ${pick.max}` : "");
+          log.push("aria_global_pick");
         }
-        return el;
-      };
+        if (debug) debugPeek = JSON.stringify(allNow.slice(0,3));
+      } else {
+        log.push("aria_none_found");
+      }
+    } catch {
+      log.push("aria_wait_timeout");
+    }
 
-      // 1a) Suche nach Textknoten, die eines der Labels enthalten
-      const walker = document.createTreeWalker(document.querySelector("main") || document.body, NodeFilter.SHOW_TEXT);
-      let labelNode = null;
-      while (walker.nextNode()) {
-        const t = (walker.currentNode.nodeValue || "").trim();
-        if (!t) continue;
-        const hit = LABELS.some((l) => t.includes(l));
-        if (hit) {
-          labelNode = walker.currentNode;
-          break;
+    // ---------- 2) Gezielt: Bereich um „Abonnements“ ----------
+    if (!subs) {
+      const around = await page.evaluate(() => {
+        const LABELS = ["Abonnements", "Abonnements!", "Abonnenten", "Subscribers", "Subscriptions"];
+        const main = document.querySelector("main") || document.body;
+
+        const hasLabel = (el) =>
+          LABELS.some(l =>
+            (el.textContent || "").toLowerCase().includes(l.toLowerCase())
+          );
+
+        // finde den Container, der das Label enthält
+        let container = null;
+        const sections = Array.from(main.querySelectorAll("section,div"));
+        for (const el of sections) {
+          if (hasLabel(el)) { container = el; break; }
         }
-      }
-      if (!labelNode) return { scope: "label_not_found" };
+        if (!container) return null;
 
-      const container = getNearestContainer(labelNode.parentElement || document.body);
-
-      // 1b) Versuche zuerst ARIA Progressbar in der Nähe
-      const pb = container.querySelector('[role="progressbar"][aria-valuenow]');
-      if (pb) {
-        const now = pb.getAttribute("aria-valuenow") || "";
-        const max = pb.getAttribute("aria-valuemax") || "";
-        return { scope: "aria_near_label", now, max, raw: now };
-      }
-
-      // 1c) Fallback: Lies sichtbaren Text des Containers und nimm die erste Zahl NACH dem Label
-      // z.B. "Noch 39 Abonnements! 321 / 360"
-      const text = (container.textContent || "").replace(/\s+/g, " ").trim();
-      // Suche zuerst Muster "x / y"
-      let m = text.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-      if (m) {
-        return { scope: "text_ratio", raw: m[1] };
-      }
-      // danach irgendeine Zahl, die hinter dem Label vorkommt
-      for (const L of LABELS) {
-        const idx = text.indexOf(L);
-        if (idx >= 0) {
-          const tail = text.slice(idx + L.length);
-          const m2 = tail.match(/(\d[\d\.\s,]*)/);
-          if (m2) return { scope: "text_after_label", raw: m2[1] };
+        // 2a) Progressbar im Container
+        const pb = container.querySelector('[role="progressbar"][aria-valuenow]');
+        if (pb) {
+          return {
+            scope: "aria_near_label",
+            raw: pb.getAttribute("aria-valuenow") || "",
+            rawMax: pb.getAttribute("aria-valuemax") || "",
+            txt: (pb.textContent || "").replace(/\s+/g," ").trim()
+          };
         }
+
+        // 2b) Text „x / y“ im Container
+        const t = (container.textContent || "").replace(/\s+/g, " ").trim();
+        const m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+        if (m) return { scope: "text_ratio", raw: m[1], txt: t };
+
+        // 2c) erste Zahl NACH dem Label
+        for (const L of LABELS) {
+          const idx = t.indexOf(L);
+          if (idx >= 0) {
+            const tail = t.slice(idx + L.length);
+            const m2 = tail.match(/(\d[\d\.\s,]*)/);
+            if (m2) return { scope: "text_after_label", raw: m2[1], txt: t };
+          }
+        }
+        return { scope: "near_label_but_not_found", txt: t };
+      });
+
+      if (around?.raw) {
+        foundRaw = String(around.raw);
+        subs = toInt(foundRaw);
+        log.push(around.scope || "near_label_hit");
+        if (debug) debugPeek = (debugPeek ? debugPeek + " | " : "") + (around.txt || "");
+      } else {
+        log.push(around?.scope || "near_label_miss");
       }
-      // Letzter globaler Versuch: irgendein Ratio auf der Seite
-      const any = document.body.textContent?.replace(/\s+/g, " ") || "";
-      const g = any.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-      if (g) return { scope: "text_ratio_global", raw: g[1] };
+    }
 
-      return { scope: "no_number_found" };
-    });
-
-    if (result?.raw || result?.now) {
-      foundRaw = String(result.raw || result.now);
-      subs = toInt(foundRaw);
-      log.push(result.scope || "hit");
-    } else {
-      log.push(result?.scope || "miss");
+    // ---------- 3) Letzter Fallback: irgendwo „x / y“ ----------
+    if (!subs) {
+      const fallback = await page.evaluate(() => {
+        const t = (document.querySelector("main")?.textContent || document.body.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+        return m ? { raw: m[1], txt: t } : null;
+      });
+      if (fallback?.raw) {
+        foundRaw = fallback.raw;
+        subs = toInt(foundRaw);
+        log.push("text_ratio_global");
+        if (debug) debugPeek = (debugPeek ? debugPeek + " | " : "") + (fallback.txt || "");
+      } else {
+        log.push("text_ratio_miss");
+      }
     }
 
     await browser.close();
-    return res.json({ subs, foundRaw, url, log });
+    const out = { subs, foundRaw, url, log };
+    if (debug) out.debugPeek = debugPeek?.slice(0, 800);
+    return res.json(out);
   } catch (e) {
     await browser.close();
     return res.status(500).json({ error: e.message, url, log });
