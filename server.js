@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------------- Helper ---------------- */
+/* ---------------- Helpers ---------------- */
 const toInt = (text) => {
   if (!text) return 0;
   const s = String(text).toLowerCase().replace(/,/g, ".").replace(/\s/g, "").trim();
@@ -29,87 +29,89 @@ async function createBrowser() {
   });
 }
 
-/* ---------------- intern: Scroll + Extraktion ---------------- */
+/* ---------------- Page helpers ---------------- */
+
+// Öffnet sicher den „Über/About“-Tab, falls die SPA nicht korrekt dort gelandet ist
+async function ensureAboutOpen(page) {
+  try {
+    const link =
+      (await page.$('a[href$="/about"]')) ||
+      (await page.$('a:has-text("Über")')) ||
+      (await page.$('a:has-text("About")'));
+    if (link) {
+      await link.click({ delay: 40 });
+      await page.waitForTimeout(1200);
+    }
+  } catch {}
+}
+
+// Scrollt die Seite einmal vollständig durch (Lazy-Loading anstoßen)
 async function deepScroll(page) {
   await page.evaluate(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    let h = document.body.scrollHeight;
     let y = 0;
-    while (y + innerHeight < h && y < 20000) { // hartes Cap
+    let h = document.body.scrollHeight;
+    while (y + innerHeight < h && y < 30000) {
       y += Math.floor(innerHeight * 0.9);
       scrollTo(0, y);
       await sleep(250);
       h = document.body.scrollHeight;
     }
-    // kurz wieder nach oben
     scrollTo(0, 0);
   });
 }
 
-async function extractSubsNearLabel(page) {
-  return await page.evaluate(() => {
-    const LABELS = ["abonnement", "abonnements", "abonnenten", "subscribers", "subscriptions"];
+// Liest im Umfeld des Labels „Abonnements/…“ die Zahl **vor** dem Slash („X / Y“) aus
+async function readSubsNearLabel(page) {
+  return page.evaluate(() => {
+    const LABELS = ["Abonnement", "Abonnements", "Abonnenten", "Subscribers", "Subscriptions"];
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-    const low = (s) => norm(s).toLowerCase();
     const main = document.querySelector("main") || document.body;
 
-    const ratioFromNode = (root) => {
+    const ratioFrom = (root) => {
       if (!root) return null;
       const nodes = [root, ...root.querySelectorAll("*")];
       for (const n of nodes) {
-        // Text
         const t = norm(n.textContent || "");
         let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (m) return { num: m[1], den: m[2], scope: "near_label_text" };
-        // Attribute
+        if (m) return { num: m[1], scope: "near_label_text" };
         for (const a of Array.from(n.attributes || [])) {
           const v = norm(a.value || "");
           m = v.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-          if (m) return { num: m[1], den: m[2], scope: "near_label_attr" };
+          if (m) return { num: m[1], scope: "near_label_attr" };
         }
       }
       return null;
     };
 
-    // Kandidaten mit Label
-    const nodes = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 5000)];
-    const labels = nodes.filter((el) => {
-      const txt = low(el.textContent || "");
-      if (!txt) return false;
-      return LABELS.some((L) => txt.includes(L));
-    });
+    // Erstes Element, das eines der Label-Wörter enthält
+    const all = [main, ...Array.from(main.querySelectorAll("*")).slice(0, 5000)];
+    const labelEl = all.find((el) =>
+      LABELS.some((L) => (el.textContent || "").toLowerCase().includes(L.toLowerCase()))
+    );
+    if (!labelEl) return null;
 
-    for (const el of labels) {
-      // im Container (bis 6 Eltern hoch)
-      let p = el;
-      for (let i = 0; i < 6 && p; i++) {
-        const r = ratioFromNode(p);
-        if (r) return { raw: r.num, scope: r.scope };
-        p = p.parentElement;
-      }
-      // in den nächsten Geschwistern
-      let s = el.nextElementSibling;
-      for (let i = 0; i < 6 && s; i++) {
-        const r = ratioFromNode(s);
-        if (r) return { raw: r.num, scope: "near_label_sibling" };
-        s = s.nextElementSibling;
-      }
+    // a) Im Container / Eltern (bis 6 Ebenen)
+    let p = labelEl;
+    for (let i = 0; i < 6 && p; i++) {
+      const r = ratioFrom(p);
+      if (r) return { raw: r.num, scope: r.scope };
+      p = p.parentElement;
+    }
+    // b) In nachfolgenden Geschwistern (bis 8 Schritte)
+    let s = labelEl.nextElementSibling;
+    for (let i = 0; i < 8 && s; i++) {
+      const r = ratioFrom(s);
+      if (r) return { raw: r.num, scope: "near_label_sibling" };
+      s = s.nextElementSibling;
     }
 
-    // HTML-Backup: „…abonn… <irgendwas> X / Y“  (max 1200 Zeichen danach)
+    // c) HTML-Fallback: „abonn… … X / Y“ (bis 1200 Zeichen danach)
     const html = document.documentElement?.innerHTML || "";
-    const mHtml = html.match(/abonn\w*[\s\S]{0,1200}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
-    if (mHtml) return { raw: mHtml[1], scope: "html_after_label" };
+    const m = html.match(/abonn\w*[\s\S]{0,1200}?(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/i);
+    if (m) return { raw: m[1], scope: "html_after_label" };
 
     return null;
-  });
-}
-
-async function extractGlobalRatio(page) {
-  return await page.evaluate(() => {
-    const t = (document.body.innerText || "").replace(/\s+/g, " ").trim();
-    const m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-    return m ? { raw: m[1], scope: "text_ratio_global" } : null;
   });
 }
 
@@ -138,7 +140,7 @@ app.get("/subs", async (req, res) => {
     },
   });
 
-  // kleines Stealth
+  // minimales Stealth
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", { get: () => ["de-DE", "de", "en-US", "en"] });
@@ -146,17 +148,11 @@ app.get("/subs", async (req, res) => {
   });
 
   const page = await ctx.newPage();
-  // Bilder/Media blocken (JS/CSS/Fonts erlauben)
-  await page.route("**/*", (route) => {
-    const t = route.request().resourceType();
-    if (["image", "media"].includes(t)) return route.abort();
-    return route.continue();
-  });
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // Cookiebanner best effort
+    // Cookiebanner (best effort)
     try {
       const btn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -166,31 +162,33 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
-    // ===== 3 Versuche: scrollen + in Label-Nähe lesen =====
-    for (let attempt = 1; attempt <= 3 && !subs; attempt++) {
+    // ==== bis zu 4 Versuche: Tab öffnen, scrollen, dann lesen ====
+    for (let attempt = 1; attempt <= 4 && !subs; attempt++) {
+      await ensureAboutOpen(page);
       await deepScroll(page);
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(700);
 
-      // 1) ARIA (falls vorhanden)
+      // 1) ARIA-Progressbar (wenn vorhanden)
       try {
-        const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
-          els.map(e => e.getAttribute("aria-valuenow") || "")
+        const ariaVals = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
+          els.map(e => e.getAttribute("aria-valuenow") || "").filter(Boolean)
         );
-        const first = aria.find(v => !!v);
-        if (first) {
-          foundRaw = first;
-          subs = toInt(first);
-          log.push("aria_found");
-          break;
+        if (ariaVals.length) {
+          const raw = ariaVals[0];
+          const n = toInt(raw);
+          if (n) {
+            subs = n;
+            foundRaw = raw;
+            log.push("aria_found");
+            break;
+          }
         } else {
           log.push("aria_none");
         }
-      } catch {
-        log.push("aria_error");
-      }
+      } catch { log.push("aria_error"); }
 
-      // 2) Strikt am Label „Abonn…“ auslesen (X vor /)
-      const near = await extractSubsNearLabel(page);
+      // 2) Strikt am Label „Abonn…“ → „X / Y“ → X
+      const near = await readSubsNearLabel(page);
       if (near?.raw) {
         foundRaw = near.raw;
         subs = toInt(foundRaw);
@@ -200,23 +198,12 @@ app.get("/subs", async (req, res) => {
         log.push("abonnements_scan_miss");
       }
 
-      // 3) Letzter Versuch im Durchgang: globales „X / Y“
-      const glob = await extractGlobalRatio(page);
-      if (glob?.raw) {
-        foundRaw = glob.raw;
-        subs = toInt(foundRaw);
-        log.push(glob.scope);
-        break;
-      }
-
-      // kleiner Cooldown zwischen den Versuchen
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(900);
     }
 
     if (debug && !foundRaw) {
-      // nur kurze Probe
-      const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
-      debugPeek = bodyText.slice(0, 400);
+      const text = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
+      debugPeek = text.slice(0, 400);
     }
 
     await browser.close();
@@ -235,6 +222,7 @@ app.get("/subs-text", async (req, res) => {
 
   let subs = 0;
   try {
+    // Immer lokal aufrufen – stabil auf Render
     const local = `http://127.0.0.1:${PORT}/subs?slug=${encodeURIComponent(slug)}`;
     const r = await fetch(local);
     if (r.ok) {
