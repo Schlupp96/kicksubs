@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* Helpers */
+/* ==================== Helper ==================== */
 const toInt = (text) => {
   if (!text) return 0;
   const s = String(text).toLowerCase().replace(/,/g, ".").replace(/\s/g, "").trim();
@@ -16,7 +16,6 @@ const toInt = (text) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-/* Browser (nur EINMAL definieren!) */
 async function createBrowser() {
   return chromium.launch({
     headless: true,
@@ -30,9 +29,7 @@ async function createBrowser() {
   });
 }
 
-/* =======================================================================
-   /subs
-   ======================================================================= */
+/* ==================== /subs ==================== */
 app.get("/subs", async (req, res) => {
   const slug = (req.query.slug || "").trim();
   const debug = String(req.query.debug || "") === "1";
@@ -74,6 +71,7 @@ app.get("/subs", async (req, res) => {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForSelector("body", { timeout: 15000 });
 
+    // Cookiebanner wegklicken
     try {
       const btn =
         (await page.$("text=Alle akzeptieren")) ||
@@ -83,6 +81,7 @@ app.get("/subs", async (req, res) => {
       if (btn) { await btn.click({ timeout: 800 }); log.push("consent_clicked"); }
     } catch {}
 
+    // leicht scrollen
     await page.evaluate(async () => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       for (let i = 0; i < 2; i++) { window.scrollBy(0, window.innerHeight); await sleep(200); }
@@ -90,7 +89,7 @@ app.get("/subs", async (req, res) => {
     });
     await page.waitForTimeout(1000);
 
-    // 1) Progressbar
+    /* === 1) ARIA-Progressbar === */
     try {
       const aria = await page.$$eval('[role="progressbar"][aria-valuenow]', els =>
         els.map(e => ({
@@ -112,11 +111,12 @@ app.get("/subs", async (req, res) => {
       }
     } catch { log.push("aria_error"); }
 
-    // 2) Body-Text / Regex
+    /* === 2) Text/HTML-Fallback === */
     if (!subs) {
       const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\s+/g, " ").trim());
-      if (debug) debugPeek = bodyText.slice(0, 800);
+      if (debug) debugPeek = bodyText.slice(0, 400);
 
+      // (a) Zahl hinter Label
       const lower = bodyText.toLowerCase();
       const labels = ["abonnements!", "abonnements", "abonnenten", "subscribers", "subscriptions"];
       let afterIdx = -1;
@@ -127,12 +127,70 @@ app.get("/subs", async (req, res) => {
         if (mAfter) { foundRaw = mAfter[1]; subs = toInt(foundRaw); log.push("text_after_label"); }
       }
 
+      // (b) Ratio im Text
       if (!subs) {
         const mRatio = bodyText.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
-        if (mRatio) { foundRaw = mRatio[1]; subs = toInt(foundRaw); log.push("text_ratio_global"); }
-        else { log.push("text_no_match"); }
+        if (mRatio) { foundRaw = mRatio[1]; subs = toInt(foundRaw); log.push("text_ratio_visible"); }
       }
 
+      // (c) HTML-Quelltext nach Ratio
+      if (!subs) {
+        const html = await page.content();
+        const mHtml = html.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+        if (mHtml) {
+          foundRaw = mHtml[1];
+          subs = toInt(foundRaw);
+          log.push("text_ratio_html");
+        } else {
+          // (d) gezielt DOM bei "Abonnements"
+          const around = await page.evaluate(() => {
+            const LABELS = ["Abonnements","Abonnements!","Abonnenten","Subscribers","Subscriptions"];
+            const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+            const main = document.querySelector("main") || document.body;
+            const candidates = Array.from(main.querySelectorAll("*")).filter(el => {
+              const txt = norm(el.textContent || "");
+              const attrs = Array.from(el.attributes || []).map(a => `${a.name}=${a.value}`).join(" ");
+              return LABELS.some(L => txt.includes(L) || attrs.toLowerCase().includes(L.toLowerCase()));
+            });
+            const takeFirstNumber = (s) => {
+              const m = norm(s).match(/(\d[\d\.\s,]*)/);
+              return m ? m[1] : "";
+            };
+            for (const el of candidates) {
+              const t = norm(el.textContent || "");
+              let m = t.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+              if (m) return { scope: "near_label_ratio", raw: m[1] };
+              const ih = norm(el.innerHTML || "");
+              m = ih.match(/(\d[\d\.\s,]*)\s*\/\s*(\d[\d\.\s,]*)/);
+              if (m) return { scope: "near_label_ratio_html", raw: m[1] };
+              const withAttrs = el.querySelectorAll("*");
+              for (const n of [el, ...withAttrs]) {
+                for (const a of Array.from(n.attributes || [])) {
+                  const hit = takeFirstNumber(a.value);
+                  if (hit) return { scope: "near_label_attr", raw: hit };
+                }
+              }
+              let p = el.parentElement;
+              for (let i = 0; i < 4 && p; i++) {
+                const pt = norm(p.textContent || "");
+                const h = takeFirstNumber(pt);
+                if (h) return { scope: "near_label_parent_text", raw: h };
+                p = p.parentElement;
+              }
+            }
+            return null;
+          });
+          if (around?.raw) {
+            foundRaw = around.raw;
+            subs = toInt(foundRaw);
+            log.push(around.scope || "near_label_html");
+          } else {
+            log.push("html_scan_miss");
+          }
+        }
+      }
+
+      // (e) Challenge-Erkennung
       if (!subs && /access denied|verify you are human|enable javascript|cloudflare/i.test(bodyText)) {
         log.push("challenge_detected");
       }
@@ -148,9 +206,7 @@ app.get("/subs", async (req, res) => {
   }
 });
 
-/* =======================================================================
-   /subs-text
-   ======================================================================= */
+/* ==================== /subs-text ==================== */
 app.get("/subs-text", async (req, res) => {
   const slug = (req.query.slug || "").trim();
   const name = (req.query.name || slug || "Der Kanal").trim();
@@ -170,7 +226,7 @@ app.get("/subs-text", async (req, res) => {
   res.type("text/plain; charset=utf-8").send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
 });
 
-/* Start */
+/* ==================== Start ==================== */
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
