@@ -251,17 +251,22 @@ app.get("/subs-text", async (req, res) => {
 
   let subs = 0;
   try {
-    const u = new URL(`${req.protocol}://${req.get("host")}/subs`);
-    u.searchParams.set("slug", slug);
-    const r = await fetch(u.toString());
+    // immer lokal anfragen – unabhängig von Proxy/HTTPS
+    const local = `http://127.0.0.1:${PORT}/subs?slug=${encodeURIComponent(slug)}`;
+    const r = await fetch(local, { method: "GET" });
     if (r.ok) {
       const j = await r.json();
-      if (typeof j.subs === "number") subs = j.subs;
+      if (typeof j.subs === "number" && Number.isFinite(j.subs)) subs = j.subs;
     }
-  } catch {}
+  } catch (e) {
+    // optional etwas Robustheit: notfalls NICHT 0 senden
+  }
 
-  res.type("text/plain; charset=utf-8").send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
+  res
+    .type("text/plain; charset=utf-8")
+    .send(`🎁 ${name} hat aktuell ${subs} Subscriber 💚`);
 });
+
 
 /* ---------------- Start ---------------- */
 app.listen(PORT, () => {
